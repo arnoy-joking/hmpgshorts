@@ -1,6 +1,6 @@
 const https = require('https');
 
-// --- HELPER 1: HTTP Request ---
+// --- HELPER: Fetch HTML ---
 const fetchHtml = (url, cookieHeader) => {
   return new Promise((resolve, reject) => {
     const options = {
@@ -10,10 +10,13 @@ const fetchHtml = (url, cookieHeader) => {
         'Accept-Language': 'en-US,en;q=0.5',
       }
     };
-
     if (cookieHeader) options.headers['Cookie'] = cookieHeader;
 
     https.get(url, options, (res) => {
+      // Handle redirects (YouTube Consent page often redirects)
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        return fetchHtml(res.headers.location, cookieHeader).then(resolve).catch(reject);
+      }
       let data = '';
       res.on('data', (chunk) => data += chunk);
       res.on('end', () => resolve(data));
@@ -21,7 +24,7 @@ const fetchHtml = (url, cookieHeader) => {
   });
 };
 
-// --- HELPER 2: Parse Netscape Cookies ---
+// --- HELPER: Parse Cookies ---
 const parseNetscapeCookies = (text) => {
   if (!text) return '';
   return text.split('\n')
@@ -34,80 +37,80 @@ const parseNetscapeCookies = (text) => {
     .filter(Boolean).join('; ');
 };
 
-// --- HELPER 3: Recursive Finder ---
+// --- HELPER: Recursive Finder (Updated for ALL Formats) ---
 const findShortsData = (obj, results = []) => {
   if (!obj || typeof obj !== 'object') return results;
 
+  // FORMAT 1: Modern Shorts (Lockup View Model)
   if (obj.shortsLockupViewModel) {
     const data = obj.shortsLockupViewModel;
     try {
-      // Title
-      let title = "Unknown";
-      if (data.overlayMetadata?.primaryText?.content) {
-        title = data.overlayMetadata.primaryText.content;
-      } else if (data.accessibilityText) {
-        title = data.accessibilityText.split(',')[0];
-      }
-
-      // Views (e.g. "14M views")
-      let viewCount = "N/A";
-      if (data.overlayMetadata?.secondaryText?.content) {
-        viewCount = data.overlayMetadata.secondaryText.content;
-      }
-
-      // URL
-      let url = null;
-      const urlPath = data.onTap?.innertubeCommand?.commandMetadata?.webCommandMetadata?.url;
-      if (urlPath) url = `https://www.youtube.com${urlPath}`;
-
-      // Thumbnail
-      let thumbnail = null;
+      const id = data.entityId;
+      const title = data.overlayMetadata?.primaryText?.content || data.accessibilityText?.split(',')[0] || "Unknown";
+      const views = data.overlayMetadata?.secondaryText?.content || "";
+      const url = data.onTap?.innertubeCommand?.commandMetadata?.webCommandMetadata?.url 
+                  ? `https://www.youtube.com${data.onTap.innertubeCommand.commandMetadata.webCommandMetadata.url}` 
+                  : `https://www.youtube.com/shorts/${id}`;
+      
       const sources = data.thumbnailViewModel?.thumbnailViewModel?.image?.sources;
-      if (sources && sources.length > 0) thumbnail = sources[sources.length - 1].url;
+      const thumbnail = sources ? sources[sources.length - 1].url : null;
 
-      if (url) {
-        results.push({ id: data.entityId, title, views: viewCount, url, thumbnail });
-      }
-    } catch (err) {}
+      if (id) results.push({ id, title, views, url, thumbnail, type: 'modern' });
+    } catch (e) {}
+  }
+
+  // FORMAT 2: Classic Shorts (Reel Item Renderer)
+  if (obj.reelItemRenderer) {
+    const data = obj.reelItemRenderer;
+    try {
+      const id = data.videoId;
+      const title = data.headline?.simpleText || "Unknown";
+      const views = data.viewCountText?.simpleText || "";
+      const url = `/shorts/${id}`;
+      const thumbnail = data.thumbnail?.thumbnails ? data.thumbnail.thumbnails[0].url : null;
+
+      if (id) results.push({ 
+        id, title, views, 
+        url: `https://www.youtube.com${url}`, 
+        thumbnail, 
+        type: 'classic' 
+      });
+    } catch (e) {}
   }
 
   Object.keys(obj).forEach(key => findShortsData(obj[key], results));
   return results;
 };
 
-// --- VERCEL HANDLER ---
 export default async function handler(req, res) {
-  // Add CORS support so you can call this from anywhere
   res.setHeader('Access-Control-Allow-Credentials', true);
   res.setHeader('Access-Control-Allow-Origin', '*');
-
-  if (req.method === 'OPTIONS') {
-    res.status(200).end();
-    return;
-  }
+  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
+  
+  if (req.method === 'OPTIONS') return res.status(200).end();
 
   try {
     let cookieHeader = '';
-    
-    // Check if cookies were sent in body
     if (req.body && req.body.cookiesContent) {
       cookieHeader = parseNetscapeCookies(req.body.cookiesContent);
     }
 
     const html = await fetchHtml('https://www.youtube.com/', cookieHeader);
-    const match = html.match(/var ytInitialData\s*=\s*(\{.+?\});/);
+    
+    // Check for blocking
+    if (html.includes('Before you continue to YouTube')) {
+      return res.status(200).json({ error: "Consent Page Detected. Cookies are invalid or IP is flagged." });
+    }
 
+    const match = html.match(/var ytInitialData\s*=\s*(\{.+?\});/);
     if (!match) {
-      return res.status(500).json({ error: "Could not find YouTube data. IP might be blocked or layout changed." });
+      return res.status(500).json({ error: "Could not find ytInitialData." });
     }
 
     const json = JSON.parse(match[1]);
     const shorts = findShortsData(json);
 
-    return res.status(200).json({
-      count: shorts.length,
-      data: shorts
-    });
+    return res.status(200).json({ count: shorts.length, data: shorts });
 
   } catch (error) {
     return res.status(500).json({ error: error.message });
